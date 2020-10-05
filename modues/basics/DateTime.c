@@ -12,6 +12,23 @@ typedef struct {
     int y, M, d, h, m, s;
 } Duration;
 
+#include <langinfo.h>
+// #include <locale.h>
+// #include <stdio.h>
+int names()
+{
+    const nl_item nl_abmons[12] = { ABMON_1, ABMON_2, ABMON_3, ABMON_4, ABMON_5,
+        ABMON_6, ABMON_7, ABMON_8, ABMON_9, ABMON_10, ABMON_11, ABMON_12 };
+    const nl_item nl_months[12] = { MON_1, MON_2, MON_3, MON_4, MON_5, MON_6,
+        MON_7, MON_8, MON_9, MON_10, MON_11, MON_12 };
+    int i;
+    // setlocale(LC_ALL, "");// TODO: does this need to be enabled?
+    for (i = 0; i < 12; i++) {
+        printf("%d\t%s\t%s\n", i + 1, nl_langinfo(nl_abmons[i]),
+            nl_langinfo(nl_months[i]));
+    }
+    return 0;
+}
 // typedef struct {
 //    int y : 26, tz : 6;
 //    unsigned int M : 4, d : 5, h : 5, m : 6, s : 6, wd : 3, dst : 2,
