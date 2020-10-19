@@ -2,19 +2,28 @@
 // No #includes in headers
 
 #ifndef HAVE_JET_BASE
-#include "jet_base.h"
-#include "jet_sys_time.h"
+#include "../../../jet/modules/jet_base.h"
+#include "../../../jet/modules/jet_sys_time.h"
 #endif
 
 typedef struct XMLAttr XMLAttr;
 typedef struct XMLNode XMLNode;
 typedef struct XMLParser XMLParser;
 
+STATIC const char* const spaces
+    = "                                                 ";
+#define xmlassert(par, expr)                                                   \
+    if (!(expr))                                                               \
+        fprintf(stderr, "%s:%d: assertion failed:\n    %s\nin %s:%d:%d.\n",    \
+            __FILE__, __LINE__, #expr, par->filename, par->line, par->col),    \
+            exit(1);
+
 // if you want to use nan tagging
 // for json / xml keep list<node>
 // for yaml keep list<node*>
-// for json/xml the value IS the list item, so no extra storage (no ptr to node)
-// for yaml you may need refs to primitives (num/bool) so this cant happen
+// for json/xml the value IS the list item, so no extra storage (no ptr to
+// node) for yaml you may need refs to primitives (num/bool) so this cant
+// happen
 
 struct XMLAttr {
     const char* key;
@@ -72,6 +81,7 @@ STATIC XMLParser* XMLParser_fromStringClone(const char* str)
     par->data = pstrndup(str, len);
     par->pos = par->data;
     par->end = par->data + len;
+    par->line = 1;
     return par;
 }
 
@@ -81,13 +91,14 @@ STATIC XMLParser* XMLParser_fromFile(char* filename)
 
     struct stat sb;
     if (stat(filename, &sb) != 0) {
-        eprintf("F+: file '%s' not found.\n", filename);
+        eprintf("jetXml: file '%s' not found.\n", filename);
         return NULL;
     } else if (S_ISDIR(sb.st_mode)) {
-        eprintf("F+: '%s' is a folder; only files are accepted.\n", filename);
+        eprintf(
+            "jetXml: '%s' is a folder; only files are accepted.\n", filename);
         return NULL;
     } else if (access(filename, R_OK) == -1) {
-        eprintf("F+: no permission to read file '%s'.\n", filename);
+        eprintf("jetXml: no permission to read file '%s'.\n", filename);
         return NULL;
     }
 
@@ -105,13 +116,15 @@ STATIC XMLParser* XMLParser_fromFile(char* filename)
     ret->data = (char*)malloc(size);
     fseek(file, 0, SEEK_SET);
     if (fread(ret->data, size, 1, file) != 1) {
-        eprintf("F+: the whole file '%s' could not be read.\n", filename);
+        eprintf("jetXml: the whole file '%s' could not be read.\n", filename);
         fclose(file);
+        free(ret->data);
         return NULL;
         // would leak if ret was malloc'd directly, but we have a pool
     }
     ret->end = ret->data + size;
     ret->pos = ret->data;
+    ret->line = 1;
 
     fclose(file);
     return ret;
@@ -177,14 +190,21 @@ STATIC List(XMLAttr) * XMLParser_parseAttrs(XMLParser* parser)
         while (not isAnyOf(*parser->pos, markers)) parser->pos++;
         if (not isAnyOf(*parser->pos, "/?>"))
             *parser->pos++ = 0; // trample the marker if " or ' or spaces
-        // ^ DON't trample the markers / or > here, because in the case of e.g.
-        // <meta name=content-type content=utf8/>
-        // it will trample the / not allowing the calling parseTags to
-        // detect that the tag is self-closing. Let the caller trample.
+        // ^ DON't trample the markers / or > here, because in the case of
+        // e.g. <meta name=content-type content=utf8/> it will trample the /
+        // not allowing the calling parseTags to detect that the tag is
+        // self-closing. Let the caller trample.
 
-        while (isAnyOf(*parser->pos, " \t\n"))
+        while (isAnyOf(*parser->pos, " \t\n")) {
+            if (*parser->pos == '\n') {
+                parser->line++;
+                parser->col = 0;
+            }
+            parser->col++; // why incrememnt at each iter? set a backref to the
+                           // pos at which col started and then subtract once
+                           // later
             *parser->pos++ = 0; // skip and trample whitespace
-
+        }
         XMLAttr* attr = XMLAttr_new(name, value);
         listp = jet_PtrList_append(listp, attr);
     }
@@ -204,8 +224,13 @@ STATIC List(XMLNode) * XMLParser_parseTags(XMLParser* parser)
         switch (*parser->pos) {
         case ' ':
         case '\t':
-        case '\n':
+            parser->col++;
             parser->pos++;
+            break;
+        case '\n':
+            parser->line++;
+            parser->col = 0;
+            *parser->pos++ = 0;
             break;
         case '<': {
             *parser->pos++ = 0;
@@ -221,9 +246,23 @@ STATIC List(XMLNode) * XMLParser_parseTags(XMLParser* parser)
                 while (not isAnyOf(*parser->pos, " />\n\t"))
                     parser->pos++; // SSE?
 
-                if (*parser->pos == ' ') {
+                if (isAnyOf(
+                        *parser->pos, " \t\n")) { // TODO can you not refactor
+                                                  // this if + while?
+                    if (*parser->pos == '\n') {
+                        parser->line++;
+                        parser->col = 0;
+                    }
+                    parser->col++;
                     *parser->pos++ = 0;
-                    while (*parser->pos == ' ') parser->pos++;
+                    while (isAnyOf(*parser->pos, " \t\n")) {
+                        if (*parser->pos == '\n') {
+                            parser->line++;
+                            parser->col = 0;
+                        }
+                        parser->col++;
+                        parser->pos++;
+                    }
                     node->attributes = XMLParser_parseAttrs(parser);
                 }
                 while (*parser->pos == ' ') parser->pos++;
@@ -232,7 +271,7 @@ STATIC List(XMLNode) * XMLParser_parseTags(XMLParser* parser)
                 case '/':
                 case '?':
                     *parser->pos++ = 0;
-                    assert(*parser->pos == '>');
+                    xmlassert(parser, *parser->pos == '>');
                     noChild = true;
                 //  fall through
                 case '>':
@@ -244,15 +283,18 @@ STATIC List(XMLNode) * XMLParser_parseTags(XMLParser* parser)
                         char* closingTag = parser->pos;
                         while (*parser->pos != '>') // SSE?
                             parser->pos++; // seek to end of closing tag
+                        // ^ TODO: line may need to be incremented here
                         *parser->pos++ = 0;
 
 #ifndef FP_XML_SKIP_CLOSING_CHECKS // this is about 10% runtime for a large file
                         if (not *closingTag) {
-                            printf("error: found end of file, expected </%s>\n",
+                            printf("error: found end of file, expected "
+                                   "</%s>\n",
                                 node->tag);
                             exit(1);
                         } else if (strcasecmp(closingTag, node->tag)) {
-                            printf("error: found </%s>, expected </%s>\n",
+                            printf("%s:%d:%d: found </%s>, expected </%s>\n",
+                                parser->filename, parser->line, parser->col,
                                 closingTag, node->tag);
                             exit(1);
                         }
@@ -260,7 +302,8 @@ STATIC List(XMLNode) * XMLParser_parseTags(XMLParser* parser)
                     }
                     break;
                 default:
-                    eprintf("oops1: unexpected '%c' (\"%.16s\"...)\n",
+                    eprintf("%s:%d:%d: unexpected '%c' (\"%.16s\"...)\n",
+                        parser->filename, parser->line, parser->col,
                         *parser->pos, parser->pos);
                     break;
                 }
@@ -273,12 +316,16 @@ STATIC List(XMLNode) * XMLParser_parseTags(XMLParser* parser)
 
         {
             char* text = parser->pos;
-            // printf("oops2: unexpected '%c' (\"%.16s...\")\n", *parser->pos,
-            // parser->pos);
-            while (*parser->pos != '<' and parser->pos < parser->end)
+            // printf("oops2: unexpected '%c' (\"%.16s...\")\n",
+            // *parser->pos, parser->pos);
+            while (*parser->pos != '<' and parser->pos < parser->end) {
+                if (*parser->pos == '\n') {
+                    parser->line++;
+                    parser->col = 0;
+                }
                 parser->pos++;
-            // parser->pos = findchars_fast(parser->pos, parser->end, "<", 1);
-            // relying on the </ detector state to trample the <
+            } // parser->pos = findchars_fast(parser->pos, parser->end, "<",
+            // 1); relying on the </ detector state to trample the <
             XMLNode* textNode = XMLNode_newText(text);
             listp = jet_PtrList_append(listp, textNode);
         }
@@ -288,19 +335,36 @@ STATIC List(XMLNode) * XMLParser_parseTags(XMLParser* parser)
     return list;
 }
 
+STATIC void FMLAttr_print(XMLAttr* attr, int indent)
+{
+    // const char* quo = strpbrk(attr->val, " =&") || 1 ? "'" : "";
+    if (strcmp(attr->key, "id") && strcmp(attr->key, "class"))
+        if (strcmp(attr->val, "no") and strcmp(attr->val, "yes")
+            and (*attr->val < '0' or *attr->val > '9'
+                or strpbrk(attr->val, "-: ")))
+            printf(" %s='%s'", attr->key, attr->val);
+        else
+            printf(" %s=%s", attr->key, attr->val);
+}
+
 STATIC void XMLAttr_print(XMLAttr* attr, int indent)
 {
     printf(" %s=\"%s\"", attr->key, attr->val);
 }
-
 STATIC void XMLNode_print(XMLNode* node, int indent);
 STATIC void XMLNodeList_print(List(XMLNode) * nodeList, int indent)
 {
     jet_foreach(XMLNode*, childNode, nodeList) XMLNode_print(childNode, indent);
 }
-
-STATIC const char* const spaces
-    = "                                                 ";
+STATIC void FMLNode_print(XMLNode* node, int indent, bool skipws);
+STATIC void FMLNodeList_print(List(XMLNode) * nodeList, int indent, bool skipws)
+{
+    jet_foreach(XMLNode*, childNode, nodeList)
+    {
+        printf("%.*s", indent, spaces);
+        FMLNode_print(childNode, indent, skipws);
+    }
+}
 STATIC void XMLNode_print(XMLNode* node, int indent)
 {
     if (node->tag) {
@@ -313,5 +377,94 @@ STATIC void XMLNode_print(XMLNode* node, int indent)
         if (node->children) printf("%.*s</%s>\n", indent, spaces, node->tag);
     } else {
         printf("%.*s%s\n", indent, spaces, node->text);
+    }
+}
+
+STATIC void FMLStr_print(const char* str, int indent, bool skipws)
+{
+    // printf("%.*s`", indent, spaces);
+    printf("`");
+    const char* c = str;
+    while (*c) {
+        switch (*c) {
+        case '\n':
+            if (!skipws) printf("\n%.*s", indent, spaces);
+            break;
+            // fallthru
+        case ' ':
+        case '\t':
+            putc(*c, stdout);
+            if (skipws) {
+                while (isAnyOf(*c, " \n\t")) c++;
+                continue;
+            }
+            break;
+        case '`':
+            printf("\\`");
+            break;
+        // case '\0':
+        //     return;
+        case '&':
+        default:
+            putc(*c, stdout);
+        }
+        c++;
+    }
+    printf("`\n");
+
+    // printf("%.*s`\n", indent, spaces);
+    // puts('`');
+}
+
+STATIC void FMLNode_print(XMLNode* node, int indent, bool skipws)
+{
+    if (node->tag) {
+        printf("%s", node->tag);
+
+        jet_foreach(XMLAttr*, attr, node->attributes) //
+            if (not strcmp(attr->key, "id"))
+        {
+            printf(" #%s", attr->val);
+            break;
+        }
+
+        jet_foreach(XMLAttr*, attr, node->attributes) //
+            if (not strcmp(attr->key, "class"))
+        {
+            // str_tr_ip(attr->val, ' ', '.', 0);
+            char* now = attr->val;
+            char* nxt = strchr(attr->val, ' ');
+            while (nxt) {
+                printf(" .%.*s", nxt - now, now);
+                now = nxt + 1;
+                nxt = strchr(now, ' ');
+            }
+            if (*now) printf(" .%s", now);
+
+            break;
+        }
+
+        jet_foreach(XMLAttr*, attr, node->attributes)
+            FMLAttr_print(attr, indent);
+        // if (node->attributes)
+        // PARENT MUST PRINT INDENTATION if you want to collapse single-child
+        // tags with no attributes like div > div > div and so on.
+        bool skipw = strcmp(node->tag, "script") and strcmp(node->tag, "style");
+        if (1 or node->attributes
+            or (node->children and node->children->next)) {
+            printf("\n");
+            FMLNodeList_print(node->children, indent + 3, skipw);
+        } else {
+            printf(" > ");
+            // printf(" > ", indent, spaces);
+            FMLNodeList_print(node->children, indent + 3, skipw);
+        } // if (node->children) printf("%.*s</%s>\n", indent, spaces,
+          // node->tag);
+    } else {
+        // TODO: split the node->text by newlines and indent each line
+        // this always needs to be quoted!!!!
+
+        FMLStr_print(node->text, indent, skipws);
+        // printf("%.*s`%s`\n", indent, spaces, node->text);
     }
 }
